@@ -62,6 +62,9 @@ run 5-15 minutes late at busy times.
 - `max_rent` — homes above this are ignored (rent before utilities).
 - `preferred_rent` — homes above this are still sent, marked "above 7.000 kr".
 - `near_miss_rent` — homes between `max_rent` and this appear in the daily summary only.
+- `time_limited_min_end` — time-limited homes only: ignore homes whose rental period ends
+  before this date (`"2027-04-01"` = must run to April 2027 or later). Set it to `""`
+  to turn the filter off. Homes whose end date cannot be read are still sent.
 - `include_extended` — `false` drops the zones adjacent to zones 1-2.
 - `include_wide` — `false` goes back to zones 1-2 (plus adjacent) only.
 - `wide_sources` — which sources use the wide area. Remove `"ledige"` to keep vacant

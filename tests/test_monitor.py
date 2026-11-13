@@ -140,6 +140,41 @@ class TimeLimitedTests(unittest.TestCase):
         self.assertEqual(homes[0]["period"], "01-09-2026 - 31-03-2028")
         self.assertEqual([h["flexible"] for h in homes], [False, True])
 
+    def test_end_dates(self):
+        cases = {"1. okt. 26 - 15. juni 27": (2027, 6, 15), "nu - 31.08.2027": (2027, 8, 31),
+                 "LEDIG NU til 30-06-2027": (2027, 6, 30), "1.11-2026-15.01.2027": (2027, 1, 15),
+                 "15. april - 31. marts 2027": (2027, 3, 31), "16.11.26 til 31.03.28": (2028, 3, 31),
+                 "1. nov.26 - 15. juni 27": (2027, 6, 15), "01.12.2026 – 30.04-2027": (2027, 4, 30),
+                 "Klar til indflytning - 3. maj 2027": (2027, 5, 3), "Frem til 31.01.2027.": (2027, 1, 31)}
+        for text, ymd in cases.items():
+            self.assertEqual(monitor.end_date(text), dt.date(*ymd), text)
+        self.assertIsNone(monitor.end_date("efter aftale"))
+        self.assertIsNone(monitor.end_date(""))
+
+    def test_minimum_end_date_filter(self):
+        cfg = dict(CFG, time_limited_min_end="2027-04-01")
+        z = zones()
+        got = sorted(h["title"] for h in self.homes if monitor.match(h, cfg, z))
+        # Solsiden 3D ends 31 March 2027 and drops out; homes with no readable end date stay
+        self.assertEqual(got, ["Paltholmpark 5", "Ukendtvej 9"])
+        home = monitor.parse_ledige(tenancy())
+        self.assertIsNotNone(monitor.match(home, cfg, z))  # other sources are not affected
+
+    def test_estate_links_and_period_variant(self):
+        by = {h["title"]: h for h in self.homes}
+        self.assertEqual(by["Lærkevej 3"]["estate_link"], "https://example.invalid/x")
+        self.assertEqual(by["Drosselvej 15"]["estate_link"], "https://example.invalid/x")
+        self.assertEqual(by["Solsiden 3D"]["estate_link"], "")
+        homes = monitor.parse_time_limited(
+            "<h3>Klosterparken</h3><p>Vej 1<br>4400 Kalundborg<br>Husleje: 4.585 kroner<br>"
+            "TIDSBEGRÆNSET Periode: 15-11-2026 – 06-12-2027</p><p><a href='/x/y/'>Læs mere</a></p>")
+        self.assertEqual(homes[0]["ends"], dt.date(2027, 12, 6))
+        self.assertEqual(homes[0]["estate_link"], "https://dab-lejerbo.dk/x/y/")
+        text = monitor.format_home(homes[0], {"tier": "wide", "area": "X", "zones": ""}, CFG)
+        self.assertIn("Estate page and photos: https://dab-lejerbo.dk/x/y/", text)
+        self.assertIn("google.com/maps", text)
+        self.assertIn('<a href="https://dab-lejerbo.dk/x/y/">', monitor.short_line(homes[0]))
+
     def test_alert_has_apply_link(self):
         home = next(h for h in self.homes if h["title"] == "Solsiden 3D")
         text = monitor.format_home(home, zones().lookup("2300"), CFG)

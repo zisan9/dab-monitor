@@ -2,6 +2,7 @@
   "max_rent": 7500,
   "preferred_rent": 7000,
   "near_miss_rent": 8500,
+  "time_limited_min_end": "2027-04-01",
   "include_extended": true,
   "include_wide": true,
   "wide_sources": ["time_limited", "ledige"],

@@ -248,7 +248,25 @@ _POSTCODE_LINE = re.compile(r"(?:^|\s)(\d{4})\s+([A-ZÆØÅ][^\d\n]*)$")
 _POSTCODE_TAIL = re.compile(r"[,\s]*(?:postnummer og by\s*)?\b\d{4}\s+[A-ZÆØÅ][^\d\n]*$", re.I)
 _RENT = re.compile(r"husleje[^\d\n]*([\d.]+(?:,\d+)?)", re.I)
 _DEPOSIT = re.compile(r"indskud[^\d\n]*([\d.]+(?:,\d+)?)", re.I)
-_PERIOD = re.compile(r"udlejningsperiode:?\s*(.*)", re.I)
+_PERIOD = re.compile(r"(?:udlejnings)?periode:?\s*(.*)", re.I)
+_LINK = re.compile(r"<a\b[^>]*\bhref=[\"']([^\"']+)[\"']", re.I)
+_MONTHS = ["jan", "feb", "mar", "apr", "maj", "jun", "jul", "aug", "sep", "okt", "nov", "dec"]
+_DATE_NUM = re.compile(r"(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{4}|\d{2})(?!\d)")
+_DATE_NAME = re.compile(r"(\d{1,2})\.?\s*(" + "|".join(_MONTHS) + r")[a-zæøå]*\.?\s*(\d{4}|\d{2})(?!\d)", re.I)
+
+
+def end_date(period: str) -> dt.date | None:
+    """Last date written in a rental period such as '1. okt. 26 - 15. juni 27' or 'nu - 31.08.2027'."""
+    found = [(m.start(), m.group(1), m.group(2), m.group(3)) for m in _DATE_NUM.finditer(period)]
+    found += [(m.start(), m.group(1), str(_MONTHS.index(m.group(2).lower()) + 1), m.group(3))
+              for m in _DATE_NAME.finditer(period)]
+    if not found:
+        return None
+    _, day, month, year = max(found)
+    try:
+        return dt.date(int(year) + (2000 if len(year) == 2 else 0), int(month), int(day))
+    except ValueError:
+        return None
 
 
 def danish_number(text: str) -> float | None:
@@ -291,6 +309,7 @@ def split_homes(lines: list[str]) -> list[list[str]]:
 def parse_time_limited(content: str) -> list[dict]:
     """The page is hand-written: an <h3> per estate, then <p> blocks holding one or more homes."""
     homes, estate, seen = [], "", set()
+    estate_links: dict[str, str] = {}  # the "Læs mere" link under each estate heading
     for m in re.finditer(r"<(h[2-4]|p)\b[^>]*>(.*?)</\1>", content, flags=re.S | re.I):
         tag, lines = m.group(1).lower(), html_to_lines(m.group(2))
         if not lines:
@@ -298,6 +317,10 @@ def parse_time_limited(content: str) -> list[dict]:
         if tag != "p":
             estate = " ".join(lines)
             continue
+        link = _LINK.search(m.group(2))
+        if link and estate:
+            href = html.unescape(link.group(1))
+            estate_links.setdefault(estate, urllib.parse.urljoin(BASE, href))
         postcode = city = None  # a home without its own postcode line takes the one above it
         for chunk in split_homes(lines):
             for ln in chunk:
@@ -332,11 +355,14 @@ def parse_time_limited(content: str) -> list[dict]:
                 "deposit": danish_number(dep_m.group(1)) if dep_m else None,
                 "rooms": None, "sqm": None, "kind": "", "available": "",
                 "period": period.strip(" ."),
+                "ends": end_date(period),
                 "flexible": bool(re.search(r"fleksib", text, re.I)),
                 "estate": estate,
                 "details": text,
                 "link": BASE + TIME_LIMITED_PATH,
             })
+    for home in homes:
+        home["estate_link"] = estate_links.get(home["estate"], "")
     return homes
 
 
@@ -377,15 +403,35 @@ def match(home: dict, cfg: dict, zones: Zones) -> dict | None:
     rent = home.get("rent")
     if rent is not None and rent > cfg["max_rent"]:
         return None
+    if ends_too_soon(home, cfg):
+        return None
     return zone
+
+
+def ends_too_soon(home: dict, cfg: dict) -> bool:
+    """Time-limited homes only: the tenancy ends before cfg['time_limited_min_end'].
+    A home whose end date could not be read is kept."""
+    limit, ends = cfg.get("time_limited_min_end"), home.get("ends")
+    if home.get("source") != "time_limited" or not limit or ends is None:
+        return False
+    return ends < dt.date.fromisoformat(limit)
 
 
 def near_miss(home: dict, cfg: dict, zones: Zones) -> bool:
     """In the area, but a little over the rent cap. Reported in the daily summary only."""
     rent, top = home.get("rent"), cfg.get("near_miss_rent", 0)
-    if rent is None or not cfg["max_rent"] < rent <= top:
+    if rent is None or not cfg["max_rent"] < rent <= top or ends_too_soon(home, cfg):
         return False
     return zones.lookup(home.get("postcode"), home.get("source")) is not None
+
+
+def map_link(home: dict) -> str:
+    query = f"{home['title']}, {home['postcode']} {home['city']}, Denmark"
+    return "https://www.google.com/maps/search/?api=1&query=" + urllib.parse.quote(query)
+
+
+def anchor(url: str, text: str) -> str:
+    return f'<a href="{html.escape(url, quote=True)}">{html.escape(text)}</a>'
 
 
 def kr(value) -> str:
@@ -424,11 +470,14 @@ def format_home(home: dict, zone: dict, cfg: dict) -> str:
             lines.append(e(f"Status: {home['available']}"))
         if home.get("estate"):
             lines.append(e(f"Estate: {home['estate']}"))
-        lines.append(home["link"])
+        lines.append(anchor(map_link(home), "Map"))
+        lines.append("Listing: " + home["link"])
         return "\n".join(lines)
 
     if home.get("period"):
         lines.append(e(f"Period: {home['period']}"))
+    elif home.get("ends") is None:
+        lines.append("Period: could not be read, check the listing")
     if home.get("estate"):
         lines.append(e(f"Estate: {home['estate']}"))
     if home.get("flexible"):
@@ -436,18 +485,24 @@ def format_home(home: dict, zone: dict, cfg: dict) -> str:
     lines.append("<i>" + e(home["details"]) + "</i>")
     lines.append("<b>First come, first served.</b> Apply now:")
     lines.append(TIME_LIMITED_FORM)
-    lines.append("Listing: " + home["link"])
+    if home.get("estate_link"):
+        lines.append("Estate page and photos: " + home["estate_link"])
+    lines.append(anchor(map_link(home), "Map") + " · " + anchor(home["link"], "All time-limited homes"))
     return "\n".join(lines)
 
 
 def short_line(home: dict) -> str:
+    """One list line. The address opens the home's own page where there is one."""
     rent = kr(home["rent"]) if home.get("rent") is not None else "rent ?"
-    bits = [f"{home['title']}, {home['postcode']} {home['city']}", rent]
+    address = f"{home['title']}, {home['postcode']} {home['city']}"
+    page = home.get("estate_link") or (home["link"] if home["source"] == "ledige" else "")
+    bits = [rent]
     if home.get("rooms"):
         bits.append(f"{home['rooms']} rooms")
     if home.get("period"):
         bits.append(home["period"])
-    return "• " + html.escape(" — ".join(bits))
+    line = "• " + (anchor(page, address) if page else html.escape(address))
+    return line + html.escape(" — " + " — ".join(bits))
 
 
 def chunk_lines(header: str, entries: list[tuple[str, str]], footer: str = "") -> list[tuple[str, list[str]]]:
@@ -491,10 +546,17 @@ def format_summary(cfg: dict, zones: Zones, now: dt.datetime, report: dict) -> s
         if not homes:
             continue
         homes.sort(key=lambda h: (h.get("rent") is None, h.get("rent") or 0))
-        lines += ["", f"<b>{title}</b>"] + [short_line(h) for h in homes[:cap]]
-        if len(homes) > cap:
-            lines.append(f"…and {len(homes) - cap} more")
-    return "\n".join(lines)[:MESSAGE_LIMIT + 400]
+        lines += ["", f"<b>{title}</b>"]
+        shown = 0
+        for home in homes[:cap]:  # whole lines only: a cut-off link would make Telegram reject the message
+            line = short_line(home)
+            if sum(len(x) + 1 for x in lines) + len(line) > MESSAGE_LIMIT:
+                break
+            lines.append(line)
+            shown += 1
+        if len(homes) > shown:
+            lines.append(f"…and {len(homes) - shown} more")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------- Telegram
