@@ -1,5 +1,5 @@
 {
-  "_comment": "Postcode -> Copenhagen fare zone table. tier 'core' = zones 1 and 2, 'extended' = zones bordering them (3, 30, 31, 32, 33). 'border': true means the postcode straddles a zone boundary, so the alert asks you to check the exact address. Built by hand from the DOT zone map: review and edit freely.",
+  "_comment": "Postcode -> area table. tier 'core' = fare zones 1 and 2, 'extended' = zones bordering them (3, 30, 31, 32, 33), 'wide' = the rest of Greater Copenhagen (used only for the sources named in config wide_sources). The first row that contains a postcode wins, so keep the narrow rows above the wide ranges. 'border': true means the postcode straddles a zone boundary, so the alert asks you to check the exact address. Built by hand from the DOT zone map: review and edit freely.",
   "postcodes": [
     {"from": 1000, "to": 1799, "tier": "core", "zones": "1", "area": "København K / V", "border": false},
     {"from": 1800, "to": 1999, "tier": "core", "zones": "1-2", "area": "Frederiksberg C", "border": false},
@@ -22,6 +22,16 @@
     {"from": 2820, "to": 2820, "tier": "extended", "zones": "30", "area": "Gentofte", "border": false},
     {"from": 2860, "to": 2860, "tier": "extended", "zones": "31", "area": "Søborg", "border": false},
     {"from": 2870, "to": 2870, "tier": "extended", "zones": "30-31", "area": "Dyssegård", "border": false},
-    {"from": 2920, "to": 2920, "tier": "extended", "zones": "30", "area": "Charlottenlund", "border": false}
+    {"from": 2920, "to": 2920, "tier": "extended", "zones": "30", "area": "Charlottenlund", "border": false},
+
+    {"from": 2000, "to": 2999, "tier": "wide", "zones": "", "area": "Greater Copenhagen suburbs", "border": false},
+    {"from": 3000, "to": 3000, "tier": "wide", "zones": "", "area": "Helsingør (coast line)", "border": false},
+    {"from": 3050, "to": 3060, "tier": "wide", "zones": "", "area": "Humlebæk / Espergærde (coast line)", "border": false},
+    {"from": 3400, "to": 3400, "tier": "wide", "zones": "", "area": "Hillerød (S-train)", "border": false},
+    {"from": 3450, "to": 3460, "tier": "wide", "zones": "", "area": "Allerød / Birkerød (S-train)", "border": false},
+    {"from": 3500, "to": 3520, "tier": "wide", "zones": "", "area": "Værløse / Farum (S-train)", "border": false},
+    {"from": 3600, "to": 3670, "tier": "wide", "zones": "", "area": "Frederikssund line (S-train)", "border": false},
+    {"from": 4000, "to": 4000, "tier": "wide", "zones": "", "area": "Roskilde", "border": false},
+    {"from": 4600, "to": 4600, "tier": "wide", "zones": "", "area": "Køge (S-train)", "border": false}
   ]
 }

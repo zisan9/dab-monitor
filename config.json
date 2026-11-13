@@ -1,12 +1,20 @@
 {
   "max_rent": 7500,
   "preferred_rent": 7000,
+  "near_miss_rent": 8500,
   "include_extended": true,
+  "include_wide": true,
+  "wide_sources": ["time_limited", "ledige"],
   "extra_postcodes": [],
   "sources": {
     "ledige": true,
     "time_limited": true,
     "new_builds": true
   },
+  "fast_sources": ["time_limited"],
+  "office_hours": {"weekdays": [0, 1, 2, 3, 4], "start": "07:30", "end": "17:30"},
+  "daily_summary": true,
+  "daily_summary_hour": 8,
+  "batch_over": 5,
   "failure_threshold": 3
 }

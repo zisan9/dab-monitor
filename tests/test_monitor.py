@@ -5,17 +5,21 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import monitor  # noqa: E402
 
-CFG = {"max_rent": 7500, "preferred_rent": 7000, "failure_threshold": 3,
+dt = monitor.dt
+
+CFG = {"max_rent": 7500, "preferred_rent": 7000, "near_miss_rent": 8500, "failure_threshold": 3,
+       "daily_summary": False, "fast_sources": ["time_limited"],
        "sources": {"ledige": True, "time_limited": True, "new_builds": True}}
 TABLE = [
     {"from": 1000, "to": 1799, "tier": "core", "zones": "1", "area": "K", "border": False},
     {"from": 2300, "to": 2300, "tier": "core", "zones": "1 / 3", "area": "S", "border": True},
     {"from": 2610, "to": 2610, "tier": "extended", "zones": "32", "area": "Rødovre", "border": False},
+    {"from": 2000, "to": 2999, "tier": "wide", "zones": "", "area": "Suburbs", "border": False},
 ]
 
 
-def zones(extended=True, extra=()):
-    return monitor.Zones(TABLE, list(extra), extended)
+def zones(extended=True, extra=(), wide=False):
+    return monitor.Zones(TABLE, list(extra), extended, wide, ["time_limited"])
 
 
 def tenancy(tid=1, zip_code="2300", rent=6500.0):
@@ -41,6 +45,13 @@ TIME_LIMITED_HTML = """
 <p>Ukendtvej 9<br>1620 København V<br>3 rum, pris oplyses senere</p>
 """
 
+MULTI_HOME_HTML = (
+    "<h3>Ullerupvænge, Hundested</h3>"
+    "<p>Vængevej 1B, 3390 Hundested<br>Husleje inkl. forbrug 6.789,00 Kr.<br>Indskud 4.000,00 Kr.<br>"
+    "Udlejningsperiode: 01-09-2026 - 31-03-2028<br>"
+    "Vængevej 9E<br>Husleje: 6.360,00 kr.<br>Indskud: 4.000 kr.<br>Udlejningsperiode: nu - 31-03-2028<br>"
+    "UDLEJES EFTER FLEKSIBLE REGLER<br><a href=\"x\">Læs mere</a></p>")
+
 
 class ZoneTests(unittest.TestCase):
     def test_core_extended_and_outside(self):
@@ -54,6 +65,31 @@ class ZoneTests(unittest.TestCase):
     def test_extended_switch_and_extra(self):
         self.assertIsNone(zones(extended=False).lookup("2610"))
         self.assertEqual(zones(extra=[7700]).lookup("7700")["tier"], "core")
+
+    def test_wide_tier_applies_only_to_its_sources(self):
+        self.assertIsNone(zones().lookup("2830", "time_limited"))
+        z = zones(wide=True)
+        self.assertEqual(z.lookup("2830", "time_limited")["tier"], "wide")
+        self.assertIsNone(z.lookup("2830", "ledige"))
+        self.assertEqual(z.lookup("2610", "ledige")["tier"], "extended")  # narrow row wins
+        self.assertIsNone(zones(extended=False, wide=True).lookup("2610", "time_limited"))
+        self.assertNotIn(2830, z.postcodes())
+        self.assertIn(2830, z.postcodes(wide=True))
+        self.assertIn(2610, z.postcodes())
+
+
+class TimeTests(unittest.TestCase):
+    def test_copenhagen_time(self):
+        self.assertEqual(monitor.copenhagen_now(dt.datetime(2026, 11, 13, 9, 0)).hour, 10)  # winter
+        self.assertEqual(monitor.copenhagen_now(dt.datetime(2026, 7, 1, 9, 0)).hour, 11)    # summer
+        self.assertEqual(monitor.copenhagen_now(dt.datetime(2026, 3, 29, 0, 59)).hour, 1)
+        self.assertEqual(monitor.copenhagen_now(dt.datetime(2026, 3, 29, 1, 0)).hour, 3)
+        self.assertEqual(monitor.copenhagen_now(dt.datetime(2026, 10, 25, 1, 0)).hour, 2)
+
+    def test_office_hours(self):
+        self.assertTrue(monitor.in_office_hours({}, dt.datetime(2026, 11, 13, 10, 0)))    # Friday
+        self.assertFalse(monitor.in_office_hours({}, dt.datetime(2026, 11, 13, 18, 0)))
+        self.assertFalse(monitor.in_office_hours({}, dt.datetime(2026, 11, 14, 10, 0)))   # Saturday
 
 
 class FilterTests(unittest.TestCase):
@@ -96,6 +132,21 @@ class TimeLimitedTests(unittest.TestCase):
         # in area and affordable, plus the one whose rent could not be read
         self.assertEqual(got, ["Paltholmpark 5", "Solsiden 3D", "Ukendtvej 9"])
 
+    def test_several_homes_in_one_paragraph(self):
+        homes = monitor.parse_time_limited(MULTI_HOME_HTML)
+        self.assertEqual([h["title"] for h in homes], ["Vængevej 1B", "Vængevej 9E"])
+        self.assertEqual([h["rent"] for h in homes], [6789.0, 6360.0])
+        self.assertEqual(homes[1]["postcode"], "3390")  # taken from the home above it
+        self.assertEqual(homes[0]["period"], "01-09-2026 - 31-03-2028")
+        self.assertEqual([h["flexible"] for h in homes], [False, True])
+
+    def test_alert_has_apply_link(self):
+        home = next(h for h in self.homes if h["title"] == "Solsiden 3D")
+        text = monitor.format_home(home, zones().lookup("2300"), CFG)
+        self.assertIn("First come, first served", text)
+        self.assertIn(monitor.TIME_LIMITED_FORM, text)
+        self.assertIn("Period: 1. august 2026 –31. marts 2027", text)
+
     def test_keys_are_stable_and_unique(self):
         again = monitor.parse_time_limited(TIME_LIMITED_HTML.replace("<br>", "<br />"))
         self.assertEqual([h["key"] for h in self.homes], [h["key"] for h in again])
@@ -104,9 +155,10 @@ class TimeLimitedTests(unittest.TestCase):
 
 class RunTests(unittest.TestCase):
     def new_state(self):
-        return {"initialized": False, "seen": {}, "failures": {}, "broken_alerted": {}, "heartbeat": ""}
+        return {"initialized": False, "seen": {}, "failures": {}, "broken_alerted": {}, "heartbeat": "",
+                "daily": ""}
 
-    def go(self, state, fetchers, fail_send=False):
+    def go(self, state, fetchers, fail_send=False, cfg=CFG, **kw):
         sent = []
 
         def send(text):
@@ -114,7 +166,9 @@ class RunTests(unittest.TestCase):
                 raise RuntimeError("nope")
             sent.append(text)
 
-        ok = monitor.run(CFG, zones(), state, dry_run=False, send=send, fetchers=fetchers, log=lambda *_: None)
+        kw.setdefault("now", dt.datetime(2026, 11, 13, 10, 0))
+        ok = monitor.run(cfg, zones(), state, dry_run=False, send=send, fetchers=fetchers,
+                         log=lambda *_: None, **kw)
         return ok, sent
 
     def test_alert_once_then_again_after_relisting(self):
@@ -143,6 +197,59 @@ class RunTests(unittest.TestCase):
         self.assertEqual(state["seen"]["ledige"], {})
         ok, sent = self.go(state, {"ledige": lambda: feed})
         self.assertTrue(ok)
+        self.assertEqual(len(sent), 1)
+
+    def test_many_new_homes_arrive_as_one_list(self):
+        state = self.new_state()
+        state["initialized"] = True
+        feed = [monitor.parse_ledige(tenancy(i, rent=5000.0 + i)) for i in range(1, 9)]
+        ok, sent = self.go(state, {"ledige": lambda: feed})
+        self.assertTrue(ok)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("8 new vacant homes", sent[0])
+        self.assertEqual(len(state["seen"]["ledige"]), 8)
+        ok, sent = self.go(state, {"ledige": lambda: feed})
+        self.assertEqual(sent, [])
+
+    def test_fast_check_only_first_come_sources_and_no_failure_count(self):
+        state = self.new_state()
+        calls = []
+
+        def boom():
+            raise RuntimeError("down")
+
+        home = next(h for h in monitor.parse_time_limited(TIME_LIMITED_HTML) if h["title"] == "Solsiden 3D")
+        fetchers = {"ledige": lambda: calls.append("ledige") or [], "time_limited": lambda: [home]}
+        ok, sent = self.go(state, fetchers, fast=True)   # no baseline yet: does nothing
+        self.assertEqual((sent, calls, state["seen"]), ([], [], {}))
+        state["initialized"] = True
+        ok, sent = self.go(state, fetchers, fast=True)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(calls, [])
+        for _ in range(5):
+            ok, sent = self.go(state, {"time_limited": boom}, fast=True)
+            self.assertFalse(ok)
+            self.assertEqual(sent, [])
+        self.assertFalse(state["failures"].get("time_limited"))
+        self.assertEqual(len(state["seen"]["time_limited"]), 1)
+
+    def test_daily_summary_once_a_day(self):
+        cfg = dict(CFG, daily_summary=True, daily_summary_hour=8)
+        state = self.new_state()
+        state["initialized"] = True
+        state["seen"]["ledige"] = {"12_2_1": "2026-01-01"}
+        feed = [monitor.parse_ledige(tenancy(1)), monitor.parse_ledige(tenancy(2, rent=8000.0))]
+        src = {"ledige": lambda: feed}
+        ok, sent = self.go(state, src, cfg=cfg, now=dt.datetime(2026, 11, 13, 7, 0))
+        self.assertEqual(sent, [])
+        ok, sent = self.go(state, src, cfg=cfg, now=dt.datetime(2026, 11, 13, 8, 5))
+        self.assertEqual(len(sent), 1)
+        self.assertIn("Daily summary, 13 November", sent[0])
+        self.assertIn("2 listed, 1 match", sent[0])
+        self.assertIn("Just over budget", sent[0])
+        ok, sent = self.go(state, src, cfg=cfg, now=dt.datetime(2026, 11, 13, 9, 0))
+        self.assertEqual(sent, [])
+        ok, sent = self.go(state, src, cfg=cfg, now=dt.datetime(2026, 11, 14, 9, 0))
         self.assertEqual(len(sent), 1)
 
     def test_broken_alert_once_and_recovery(self):

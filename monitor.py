@@ -1,10 +1,12 @@
 """DAB-Lejerbo vacant home monitor.
 
 Checks three public sources on dab-lejerbo.dk, keeps the homes that fall in the
-configured fare zones and rent limit, and sends a Telegram message for each one
-it has not seen before. Standard library only.
+configured area and rent limit, and sends a Telegram message for each one it
+has not seen before. Standard library only.
 
-    python monitor.py               normal run
+    python monitor.py               full check of every source
+    python monitor.py --fast        quick check of the first-come sources (office hours only)
+    python monitor.py --status      send the summary message now
     python monitor.py --dry-run     print matches, send nothing, save nothing
     python monitor.py --test-message  send a test message to Telegram
 """
@@ -34,6 +36,7 @@ LEDIGE_MODULE = "3500"
 LEDIGE_URL = f"{BASE}/api/memberportal/availabletenancies/getAllAvailableTenancies"
 LEDIGE_PAGE = f"{BASE}/boligsoegende/ledige-boliger/"
 TIME_LIMITED_PATH = "/boligsoegende/tidsbegraensede-boliger/"
+TIME_LIMITED_FORM = f"{BASE}{TIME_LIMITED_PATH}blanket-til-tidsbegraenset-bolig/"
 PAGE_CONTENT_URL = f"{BASE}/api/PageContent/GetPageContent"
 SITEMAP_URL = f"{BASE}/api/Sitemap/GetXmlSitemap"
 NEW_BUILD_PREFIX = f"{BASE}/boligsoegende/her-bygger-vi-nyt/"
@@ -44,6 +47,12 @@ SOURCE_LABELS = {
     "time_limited": "Time-limited home",
     "new_builds": "New-build project",
 }
+SOURCE_PLURALS = {
+    "ledige": "vacant homes",
+    "time_limited": "time-limited homes",
+    "new_builds": "new-build projects",
+}
+MESSAGE_LIMIT = 3500  # Telegram allows 4096 characters
 
 
 # ---------------------------------------------------------------- HTTP
@@ -83,41 +92,97 @@ def api_json(url: str, **kw) -> dict:
 # ---------------------------------------------------------------- zones
 
 class Zones:
-    def __init__(self, table: list[dict], extra: list[int], include_extended: bool):
+    """Postcode table with three tiers: core (zones 1-2), extended (adjacent zones)
+    and wide (the rest of Greater Copenhagen, applied only to the sources listed
+    in wide_sources)."""
+
+    def __init__(self, table: list[dict], extra: list[int], include_extended: bool,
+                 include_wide: bool = False, wide_sources=("time_limited",)):
         self.table = table
         self.extra = {int(p) for p in extra}
         self.include_extended = include_extended
+        self.include_wide = include_wide
+        self.wide_sources = set(wide_sources)
 
-    def lookup(self, postcode) -> dict | None:
-        """Return the zone entry if the postcode is inside the watched area."""
+    def _enabled(self, row: dict, source: str | None) -> bool:
+        if row["tier"] == "extended":
+            return self.include_extended
+        if row["tier"] == "wide":
+            return self.include_wide and (source is None or source in self.wide_sources)
+        return True
+
+    def lookup(self, postcode, source: str | None = None) -> dict | None:
+        """Return the zone entry if the postcode is inside the area watched for this source."""
         try:
             pc = int(str(postcode).strip())
         except (TypeError, ValueError):
             return None
         if pc in self.extra:
             return {"tier": "core", "zones": "custom", "area": "", "border": False}
-        for row in self.table:
+        for row in self.table:  # first match wins, so narrow rows come before wide ranges
             if row["from"] <= pc <= row["to"]:
-                if row["tier"] == "extended" and not self.include_extended:
-                    return None
-                return row
+                return row if self._enabled(row, source) else None
         return None
 
-    def postcodes(self) -> set[int]:
-        out = set(self.extra)
-        for row in self.table:
-            if row["tier"] == "extended" and not self.include_extended:
-                continue
-            out.update(range(row["from"], row["to"] + 1))
-        return out
+    def postcodes(self, wide: bool = False) -> set[int]:
+        out: set[int] = set()
+        for row in reversed(self.table):  # reversed so that earlier rows win, as in lookup
+            codes = range(row["from"], row["to"] + 1)
+            if row["tier"] == "wide":
+                keep = wide and self.include_wide
+            else:
+                keep = self._enabled(row, None)
+            if keep:
+                out.update(codes)
+            else:
+                out.difference_update(codes)
+        return out | self.extra
+
+    def describe(self) -> str:
+        text = "zones 1-2" + (" plus adjacent zones" if self.include_extended else " only")
+        wide = [SOURCE_PLURALS[s] for s in SOURCE_PLURALS if s in self.wide_sources]
+        if self.include_wide and wide:
+            text += "; all of Greater Copenhagen for " + " and ".join(wide)
+        return text
+
+
+def tier_label(zone: dict) -> str:
+    if zone["tier"] == "core":
+        return f"zone 1-2 (zones {zone['zones']})"
+    if zone["tier"] == "extended":
+        return f"adjacent zone (zones {zone['zones']})"
+    return f"wider area, {zone['area']}"
 
 
 def load_config(path: Path) -> tuple[dict, Zones]:
     cfg = json.loads(path.read_text(encoding="utf-8"))
     zones_path = path.parent / cfg.get("zones_file", "zones.json")
     table = json.loads(zones_path.read_text(encoding="utf-8"))["postcodes"]
-    zones = Zones(table, cfg.get("extra_postcodes", []), cfg.get("include_extended", True))
+    zones = Zones(table, cfg.get("extra_postcodes", []), cfg.get("include_extended", True),
+                  cfg.get("include_wide", False), cfg.get("wide_sources", ["time_limited"]))
     return cfg, zones
+
+
+# ---------------------------------------------------------------- time
+
+def copenhagen_now(utc: dt.datetime | None = None) -> dt.datetime:
+    """Danish local time, computed without a timezone database (EU summer-time rule)."""
+    utc = utc or dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+
+    def last_sunday(month: int) -> dt.datetime:
+        d = dt.datetime(utc.year, month, 31, 1)
+        return d - dt.timedelta(days=(d.weekday() + 1) % 7)
+
+    summer = last_sunday(3) <= utc < last_sunday(10)
+    return utc + dt.timedelta(hours=2 if summer else 1)
+
+
+def in_office_hours(cfg: dict, now: dt.datetime) -> bool:
+    """Time-limited homes are only posted while the office is open."""
+    oh = cfg.get("office_hours", {})
+    if now.weekday() not in oh.get("weekdays", [0, 1, 2, 3, 4]):
+        return False
+    return oh.get("start", "07:30") <= now.strftime("%H:%M") < oh.get("end", "17:30")
 
 
 # ---------------------------------------------------------------- sources
@@ -180,8 +245,10 @@ def fetch_time_limited() -> list[dict]:
 
 
 _POSTCODE_LINE = re.compile(r"(?:^|\s)(\d{4})\s+([A-ZÆØÅ][^\d\n]*)$")
+_POSTCODE_TAIL = re.compile(r"[,\s]*(?:postnummer og by\s*)?\b\d{4}\s+[A-ZÆØÅ][^\d\n]*$", re.I)
 _RENT = re.compile(r"husleje[^\d\n]*([\d.]+(?:,\d+)?)", re.I)
 _DEPOSIT = re.compile(r"indskud[^\d\n]*([\d.]+(?:,\d+)?)", re.I)
+_PERIOD = re.compile(r"udlejningsperiode:?\s*(.*)", re.I)
 
 
 def danish_number(text: str) -> float | None:
@@ -197,8 +264,32 @@ def html_to_lines(fragment: str) -> list[str]:
     return [re.sub(r"\s+", " ", ln).strip() for ln in text.split("\n") if ln.strip()]
 
 
+def split_homes(lines: list[str]) -> list[list[str]]:
+    """A paragraph sometimes holds several homes. Each home ends with its rental-period line."""
+    chunks, cur, i = [], [], 0
+    while i < len(lines):
+        cur.append(lines[i])
+        pm = _PERIOD.search(lines[i])
+        if pm:
+            if not re.search(r"\d", pm.group(1)) and i + 1 < len(lines):  # dates on the next line
+                i += 1
+                cur.append(lines[i])
+            chunks.append(cur)
+            cur = []
+        i += 1
+    if cur:
+        chunks.append(cur)
+    homes: list[list[str]] = []
+    for chunk in chunks:
+        if homes and not _RENT.search("\n".join(chunk)):
+            homes[-1].extend(chunk)  # trailing note or link: belongs to the home before it
+        else:
+            homes.append(chunk)
+    return homes
+
+
 def parse_time_limited(content: str) -> list[dict]:
-    """The page is hand-written: an <h3> per estate, then one <p> per home."""
+    """The page is hand-written: an <h3> per estate, then <p> blocks holding one or more homes."""
     homes, estate, seen = [], "", set()
     for m in re.finditer(r"<(h[2-4]|p)\b[^>]*>(.*?)</\1>", content, flags=re.S | re.I):
         tag, lines = m.group(1).lower(), html_to_lines(m.group(2))
@@ -207,35 +298,45 @@ def parse_time_limited(content: str) -> list[dict]:
         if tag != "p":
             estate = " ".join(lines)
             continue
-        postcode = city = None
-        for ln in lines:
-            pm = _POSTCODE_LINE.search(ln)
-            if pm and 1000 <= int(pm.group(1)) <= 9999:
-                postcode, city = pm.group(1), pm.group(2).strip()
-                break
-        if not postcode:
-            continue
-        text = "\n".join(lines)
-        rent_m, dep_m = _RENT.search(text), _DEPOSIT.search(text)
-        norm = re.sub(r"\W+", "", (estate + text).lower())
-        key = hashlib.sha1(norm.encode("utf-8")).hexdigest()[:16]
-        if key in seen:
-            continue
-        seen.add(key)
-        title = lines[0] if not _POSTCODE_LINE.search(lines[0]) else estate
-        homes.append({
-            "source": "time_limited",
-            "key": key,
-            "title": title,
-            "postcode": postcode,
-            "city": city,
-            "rent": danish_number(rent_m.group(1)) if rent_m else None,
-            "deposit": danish_number(dep_m.group(1)) if dep_m else None,
-            "rooms": None, "sqm": None, "kind": "", "available": "",
-            "estate": estate,
-            "details": text,
-            "link": BASE + TIME_LIMITED_PATH,
-        })
+        postcode = city = None  # a home without its own postcode line takes the one above it
+        for chunk in split_homes(lines):
+            for ln in chunk:
+                pm = _POSTCODE_LINE.search(ln)
+                if pm and 1000 <= int(pm.group(1)) <= 9999:
+                    postcode, city = pm.group(1), pm.group(2).strip(" .")
+                    break
+            if not postcode:
+                continue
+            text = "\n".join(chunk)
+            rent_m, dep_m = _RENT.search(text), _DEPOSIT.search(text)
+            norm = re.sub(r"\W+", "", (estate + text).lower())
+            key = hashlib.sha1(norm.encode("utf-8")).hexdigest()[:16]
+            if key in seen:
+                continue
+            seen.add(key)
+            period = ""
+            for i, ln in enumerate(chunk):
+                pm = _PERIOD.search(ln)
+                if pm:
+                    period = pm.group(1)
+                    if not re.search(r"\d", period) and i + 1 < len(chunk):
+                        period = (period + " " + chunk[i + 1]).strip()
+                    break
+            homes.append({
+                "source": "time_limited",
+                "key": key,
+                "title": _POSTCODE_TAIL.sub("", chunk[0]).strip(" ,") or estate,
+                "postcode": postcode,
+                "city": city,
+                "rent": danish_number(rent_m.group(1)) if rent_m else None,
+                "deposit": danish_number(dep_m.group(1)) if dep_m else None,
+                "rooms": None, "sqm": None, "kind": "", "available": "",
+                "period": period.strip(" ."),
+                "flexible": bool(re.search(r"fleksib", text, re.I)),
+                "estate": estate,
+                "details": text,
+                "link": BASE + TIME_LIMITED_PATH,
+            })
     return homes
 
 
@@ -263,11 +364,14 @@ def new_build_title(url: str) -> str:
     return path.rstrip("/").rsplit("/", 1)[-1].replace("-", " ").capitalize()
 
 
+FETCHERS = {"ledige": fetch_ledige, "time_limited": fetch_time_limited, "new_builds": fetch_new_builds}
+
+
 # ---------------------------------------------------------------- filter / format
 
 def match(home: dict, cfg: dict, zones: Zones) -> dict | None:
     """Return the zone entry when the home is in the area and within the rent cap."""
-    zone = zones.lookup(home.get("postcode"))
+    zone = zones.lookup(home.get("postcode"), home.get("source"))
     if zone is None:
         return None
     rent = home.get("rent")
@@ -276,16 +380,25 @@ def match(home: dict, cfg: dict, zones: Zones) -> dict | None:
     return zone
 
 
+def near_miss(home: dict, cfg: dict, zones: Zones) -> bool:
+    """In the area, but a little over the rent cap. Reported in the daily summary only."""
+    rent, top = home.get("rent"), cfg.get("near_miss_rent", 0)
+    if rent is None or not cfg["max_rent"] < rent <= top:
+        return False
+    return zones.lookup(home.get("postcode"), home.get("source")) is not None
+
+
 def kr(value) -> str:
     return f"{value:,.0f}".replace(",", ".") + " kr"
 
 
 def format_home(home: dict, zone: dict, cfg: dict) -> str:
     e = html.escape
-    lines = [f"🏠 <b>{e(SOURCE_LABELS[home['source']])}</b>",
+    first_come = home["source"] == "time_limited"
+    icon = "⚡" if first_come else "🏠"
+    lines = [f"{icon} <b>{e(SOURCE_LABELS[home['source']])}</b>",
              f"<b>{e(home['title'])}</b>, {e(str(home['postcode']))} {e(home['city'])}"]
-    tier = "zone 1-2" if zone["tier"] == "core" else "adjacent zone"
-    zline = f"Area: {tier} (zones {zone['zones']})"
+    zline = "Area: " + tier_label(zone)
     if zone.get("border"):
         zline += " — postcode crosses a zone border, check the address"
     lines.append(e(zline))
@@ -297,7 +410,7 @@ def format_home(home: dict, zone: dict, cfg: dict) -> str:
         lines.append(f"Rent: {kr(rent)}/month{note}")
     if home.get("deposit") is not None:
         lines.append(f"Deposit: {kr(home['deposit'])}")
-    if home["source"] == "ledige":
+    if not first_come:
         facts = []
         if home.get("rooms"):
             facts.append(f"{home['rooms']} rooms")
@@ -311,12 +424,77 @@ def format_home(home: dict, zone: dict, cfg: dict) -> str:
             lines.append(e(f"Status: {home['available']}"))
         if home.get("estate"):
             lines.append(e(f"Estate: {home['estate']}"))
-    else:
-        if home.get("estate"):
-            lines.append(e(f"Estate: {home['estate']}"))
-        lines.append("<i>" + e(home["details"]) + "</i>")
-    lines.append(home["link"])
+        lines.append(home["link"])
+        return "\n".join(lines)
+
+    if home.get("period"):
+        lines.append(e(f"Period: {home['period']}"))
+    if home.get("estate"):
+        lines.append(e(f"Estate: {home['estate']}"))
+    if home.get("flexible"):
+        lines.append("Let by flexible rules (job, study or similar criteria apply)")
+    lines.append("<i>" + e(home["details"]) + "</i>")
+    lines.append("<b>First come, first served.</b> Apply now:")
+    lines.append(TIME_LIMITED_FORM)
+    lines.append("Listing: " + home["link"])
     return "\n".join(lines)
+
+
+def short_line(home: dict) -> str:
+    rent = kr(home["rent"]) if home.get("rent") is not None else "rent ?"
+    bits = [f"{home['title']}, {home['postcode']} {home['city']}", rent]
+    if home.get("rooms"):
+        bits.append(f"{home['rooms']} rooms")
+    if home.get("period"):
+        bits.append(home["period"])
+    return "• " + html.escape(" — ".join(bits))
+
+
+def chunk_lines(header: str, entries: list[tuple[str, str]], footer: str = "") -> list[tuple[str, list[str]]]:
+    """Pack (key, line) entries into as few messages as fit. Returns (text, keys) per message."""
+    out, keys, body = [], [], []
+    for key, line in entries:
+        if body and len(header) + len(footer) + sum(len(x) + 1 for x in body) + len(line) > MESSAGE_LIMIT:
+            out.append(("\n".join([header, *body, footer]).strip(), keys))
+            keys, body = [], []
+        keys.append(key)
+        body.append(line)
+    if body:
+        out.append(("\n".join([header, *body, footer]).strip(), keys))
+    return out
+
+
+def format_batch(source: str, new: list[tuple[dict, dict]]) -> list[tuple[str, list[str]]]:
+    """Many new homes at once (first run, or a wider area) are sent as lists, not one by one."""
+    new = sorted(new, key=lambda hz: (hz[0].get("rent") is None, hz[0].get("rent") or 0))
+    header = f"🏠 <b>{len(new)} new {SOURCE_PLURALS[source]} in your area and budget</b>"
+    footer = (f"\nFirst come, first served. Apply: {TIME_LIMITED_FORM}\nListings: {BASE}{TIME_LIMITED_PATH}"
+              if source == "time_limited" else f"\n{LEDIGE_PAGE}")
+    return chunk_lines(header, [(h["key"], short_line(h)) for h, _ in new], footer)
+
+
+def format_summary(cfg: dict, zones: Zones, now: dt.datetime, report: dict) -> str:
+    lines = [f"📊 <b>Daily summary, {now.day} {now:%B}</b>",
+             "The monitor is running. You only get other messages when a new home matches.",
+             f"Watching {html.escape(zones.describe())}, rent up to {kr(cfg['max_rent'])}.", ""]
+    for source, info in report.items():
+        label = SOURCE_PLURALS[source].capitalize()
+        if info.get("error"):
+            lines.append(f"• {label}: check FAILED")
+        elif source == "new_builds":
+            lines.append(f"• {label}: {info['listed']} tracked")
+        else:
+            lines.append(f"• {label}: {info['listed']} listed, {len(info['matches'])} match")
+    for title, field, cap in (("Open right now", "matches", 10),
+                              (f"Just over budget (up to {kr(cfg.get('near_miss_rent', 0))})", "near", 5)):
+        homes = [h for info in report.values() for h in info.get(field, [])]
+        if not homes:
+            continue
+        homes.sort(key=lambda h: (h.get("rent") is None, h.get("rent") or 0))
+        lines += ["", f"<b>{title}</b>"] + [short_line(h) for h in homes[:cap]]
+        if len(homes) > cap:
+            lines.append(f"…and {len(homes) - cap} more")
+    return "\n".join(lines)[:MESSAGE_LIMIT + 400]
 
 
 # ---------------------------------------------------------------- Telegram
@@ -339,7 +517,8 @@ def telegram_send(text: str) -> None:
 # ---------------------------------------------------------------- state
 
 def load_state(path: Path) -> dict:
-    state = {"initialized": False, "seen": {}, "failures": {}, "broken_alerted": {}, "heartbeat": ""}
+    state = {"initialized": False, "seen": {}, "failures": {}, "broken_alerted": {},
+             "heartbeat": "", "daily": ""}
     if path.exists():
         state.update(json.loads(path.read_text(encoding="utf-8")))
     return state
@@ -353,14 +532,24 @@ def save_state(path: Path, state: dict) -> None:
 # ---------------------------------------------------------------- main run
 
 def run(cfg: dict, zones: Zones, state: dict, *, dry_run: bool, send=telegram_send,
-        fetchers: dict | None = None, log=print) -> bool:
-    """One check. Returns True when every enabled source worked and all alerts were sent."""
-    fetchers = fetchers or {"ledige": fetch_ledige, "time_limited": fetch_time_limited,
-                            "new_builds": fetch_new_builds}
-    today = dt.date.today().isoformat()
+        fetchers: dict | None = None, log=print, fast: bool = False, force_summary: bool = False,
+        now: dt.datetime | None = None) -> bool:
+    """One check. Returns True when every checked source worked and all alerts were sent.
+
+    fast=True checks only cfg["fast_sources"], and only for news: it does not count
+    failures and sends no summaries. The full check does those.
+    """
+    fetchers = fetchers or FETCHERS
+    now = now or copenhagen_now()
+    today = now.date().isoformat()
     first_run = not state["initialized"]
+    if fast:
+        if first_run:
+            return True  # the first full check sets the baseline
+        wanted = set(cfg.get("fast_sources", ["time_limited"]))
+        fetchers = {s: f for s, f in fetchers.items() if s in wanted}
     ok = True
-    counts = {}
+    report: dict = {}
 
     def deliver(text: str) -> bool:
         if dry_run:
@@ -380,6 +569,10 @@ def run(cfg: dict, zones: Zones, state: dict, *, dry_run: bool, send=telegram_se
             items = fetch()
         except Exception as exc:
             ok = False
+            report[source] = {"error": True}
+            if fast:
+                log(f"{source}: failed: {exc}")
+                continue
             n = state["failures"].get(source, 0) + 1
             state["failures"][source] = n
             log(f"{source}: FAILED ({n} in a row): {exc}")
@@ -407,35 +600,57 @@ def run(cfg: dict, zones: Zones, state: dict, *, dry_run: bool, send=telegram_se
                     current[it["key"]] = today
                 else:
                     ok = False
-            counts[source] = f"{len(items)} projects tracked"
+            report[source] = {"listed": len(items)}
+            log(f"{source}: {len(items)} projects tracked")
         else:
-            matched = 0
+            matches, new = [], []
             for home in items:
                 zone = match(home, cfg, zones)
                 if zone is None:
                     continue
-                matched += 1
+                matches.append(home)
                 if home["key"] in seen:
                     current[home["key"]] = seen[home["key"]]
-                elif deliver(format_home(home, zone, cfg)):
-                    current[home["key"]] = today
+                else:
+                    new.append((home, zone))
+            if len(new) > cfg.get("batch_over", 5):
+                messages = format_batch(source, new)
+            else:
+                messages = [(format_home(h, z, cfg), [h["key"]]) for h, z in new]
+            for text, keys in messages:
+                if deliver(text):
+                    current.update((k, today) for k in keys)
                 else:
                     ok = False
-            counts[source] = f"{len(items)} homes listed, {matched} in your area and budget"
+            report[source] = {"listed": len(items), "matches": matches,
+                              "near": [h for h in items if near_miss(h, cfg, zones)]}
+            log(f"{source}: {len(items)} homes listed, {len(matches)} in your area and budget, {len(new)} new")
         # Keys that left the feed are dropped, so a home that comes back is alerted again.
         state["seen"][source] = current
-        log(f"{source}: {counts[source]}")
+
+    if fast:
+        return ok
 
     if first_run and ok:
-        summary = "\n".join(f"• {SOURCE_LABELS[s]}: {c}" for s, c in counts.items())
-        ext = "plus adjacent zones" if zones.include_extended else "only"
-        if deliver(f"✅ <b>DAB-Lejerbo monitor is live</b>\nWatching zones 1-2 {ext}, "
-                   f"rent up to {kr(cfg['max_rent'])}.\n{summary}"):
+        counts = "\n".join(
+            f"• {SOURCE_LABELS[s]}: " + (f"{r['listed']} projects tracked" if s == "new_builds" else
+                                         f"{r['listed']} homes listed, {len(r['matches'])} in your area and budget")
+            for s, r in report.items())
+        if deliver(f"✅ <b>DAB-Lejerbo monitor is live</b>\nWatching {html.escape(zones.describe())}, "
+                   f"rent up to {kr(cfg['max_rent'])}.\n{counts}"):
             state["initialized"] = True
         else:
             ok = False
 
-    year, week, _ = dt.date.today().isocalendar()
+    due = (cfg.get("daily_summary", True) and state.get("daily") != today
+           and now.hour >= cfg.get("daily_summary_hour", 8) and state["initialized"])
+    if force_summary or due:
+        if deliver(format_summary(cfg, zones, now, report)):
+            state["daily"] = today
+        else:
+            ok = False
+
+    year, week, _ = now.date().isocalendar()
     state["heartbeat"] = f"{year}-W{week:02d}"
     return ok
 
@@ -450,6 +665,11 @@ def main(argv=None) -> int:
     ap.add_argument("--config", default=str(ROOT / "config.json"))
     ap.add_argument("--state", default=str(ROOT / "state" / "seen.json"))
     ap.add_argument("--dry-run", action="store_true", help="print matches; send and save nothing")
+    ap.add_argument("--fast", action="store_true",
+                    help="check only the first-come sources, and only during office hours")
+    ap.add_argument("--status", action="store_true", help="full check, then send the summary now")
+    ap.add_argument("--in-office-hours", action="store_true",
+                    help="exit 0 if the Danish office is open now, 1 otherwise")
     ap.add_argument("--test-message", action="store_true", help="send a test message and exit")
     args = ap.parse_args(argv)
 
@@ -459,9 +679,16 @@ def main(argv=None) -> int:
         return 0
 
     cfg, zones = load_config(Path(args.config))
+    now = copenhagen_now()
+    if args.in_office_hours:
+        return 0 if in_office_hours(cfg, now) else 1
+    if args.fast and not in_office_hours(cfg, now):
+        print("outside office hours, nothing to do")
+        return 0
+
     state_path = Path(args.state)
     state = load_state(state_path)
-    ok = run(cfg, zones, state, dry_run=args.dry_run)
+    ok = run(cfg, zones, state, dry_run=args.dry_run, fast=args.fast, force_summary=args.status, now=now)
     if not args.dry_run:
         save_state(state_path, state)
     return 0 if ok else 1

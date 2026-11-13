@@ -8,6 +8,8 @@ on:
 permissions:
   contents: write
 
+# One run at a time. A run that is due while another is still going waits and
+# starts the moment that one ends, which keeps office-hours coverage continuous.
 concurrency:
   group: monitor
   cancel-in-progress: false
@@ -15,7 +17,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 58
     steps:
       - uses: actions/checkout@v4
 
@@ -23,15 +25,31 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python3 monitor.py
-
-      # Runs even when the check failed, so failure counters are kept.
-      - name: Save state
-        if: always()
         run: |
           git config user.name "monitor-bot"
           git config user.email "monitor-bot@users.noreply.github.com"
-          git add state/seen.json 2>/dev/null || exit 0
-          git diff --cached --quiet && exit 0
-          git commit -m "Update monitor state"
-          git push
+
+          save() {
+            git add state/seen.json 2>/dev/null || return 0
+            git diff --cached --quiet && return 0
+            git commit -q -m "Update monitor state"
+            git push -q || { git pull -q --rebase && git push -q; } || echo "state push failed"
+          }
+
+          # Outside Danish office hours: one full check, then stop.
+          # During office hours: stay up for 50 minutes, checking the first-come
+          # sources every minute and everything every 10th minute.
+          i=0
+          end=$((SECONDS + 3000))
+          while :; do
+            if [ $((i % 10)) -eq 0 ]; then
+              python3 monitor.py || true
+            else
+              python3 monitor.py --fast || true
+            fi
+            save
+            i=$((i + 1))
+            [ $SECONDS -lt $end ] || break
+            python3 monitor.py --in-office-hours || break
+            sleep 50
+          done
