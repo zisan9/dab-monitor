@@ -1,0 +1,12 @@
+{
+  "max_rent": 7500,
+  "preferred_rent": 7000,
+  "include_extended": true,
+  "extra_postcodes": [],
+  "sources": {
+    "ledige": true,
+    "time_limited": true,
+    "new_builds": true
+  },
+  "failure_threshold": 3
+}
