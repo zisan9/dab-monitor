@@ -1,0 +1,35 @@
+{
+ "broken_alerted": {
+  "ledige": false,
+  "new_builds": false,
+  "time_limited": false
+ },
+ "failures": {
+  "ledige": 0,
+  "new_builds": 0,
+  "time_limited": 0
+ },
+ "heartbeat": "2026-W46",
+ "initialized": true,
+ "seen": {
+  "ledige": {},
+  "new_builds": {
+   "https://dab-lejerbo.dk/boligsoegende/her-bygger-vi-nyt/blankebjerg-vig/": "2026-11-13",
+   "https://dab-lejerbo.dk/boligsoegende/her-bygger-vi-nyt/circle-house-lisbjerg/": "2026-11-13",
+   "https://dab-lejerbo.dk/boligsoegende/her-bygger-vi-nyt/englandsvej-nykoebing-f/": "2026-11-13",
+   "https://dab-lejerbo.dk/boligsoegende/her-bygger-vi-nyt/falkenberghoeje-aalsgaarde/": "2026-11-13",
+   "https://dab-lejerbo.dk/boligsoegende/her-bygger-vi-nyt/gaardbo-gauerslund/": "2026-11-13",
+   "https://dab-lejerbo.dk/boligsoegende/her-bygger-vi-nyt/hermans-minde-hoerve/": "2026-11-13",
+   "https://dab-lejerbo.dk/boligsoegende/her-bygger-vi-nyt/horsedammen-broendby/": "2026-11-13",
+   "https://dab-lejerbo.dk/boligsoegende/her-bygger-vi-nyt/kirketerp-ii-hobro/": "2026-11-13",
+   "https://dab-lejerbo.dk/boligsoegende/her-bygger-vi-nyt/kornvangen-oksboel/": "2026-11-13",
+   "https://dab-lejerbo.dk/boligsoegende/her-bygger-vi-nyt/latyrusparken-risskov/": "2026-11-13",
+   "https://dab-lejerbo.dk/boligsoegende/her-bygger-vi-nyt/mellem-soeerne-hoejby/": "2026-11-13",
+   "https://dab-lejerbo.dk/boligsoegende/her-bygger-vi-nyt/oesterbro-oelgod/": "2026-11-13",
+   "https://dab-lejerbo.dk/boligsoegende/her-bygger-vi-nyt/savvaerket-auning/": "2026-11-13",
+   "https://dab-lejerbo.dk/boligsoegende/her-bygger-vi-nyt/spentrup-randers/": "2026-11-13",
+   "https://dab-lejerbo.dk/boligsoegende/her-bygger-vi-nyt/vitaliaplus-herning/": "2026-11-13"
+  },
+  "time_limited": {}
+ }
+}
